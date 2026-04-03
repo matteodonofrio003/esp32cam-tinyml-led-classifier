@@ -1,5 +1,22 @@
-.pio
-.vscode/.browse.c_cpp.db*
-.vscode/c_cpp_properties.json
-.vscode/launch.json
-.vscode/ipch
+# Python virtual environment
+venv/
+venv_tinyml/
+.venv/
+__pycache__/
+*.pyc
+
+# PlatformIO folders
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# VS Code
+.vscode/
+.history/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Dataset (Opzionale: se il dataset diventa enorme, meglio non caricarlo su GitHub)
+# dataset/
