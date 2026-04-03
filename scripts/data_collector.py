@@ -9,10 +9,11 @@ from pathlib import Path
 from collections import defaultdict
 
 # ── Configurazione ──────────────────────────────────────────────
-PORT        = "COM3"          # Cambia con la tua porta (es. /dev/ttyUSB0)
+PORT        = "COM12"          # Verifica che sia la porta corretta
 BAUD_RATE   = 921600
 IMG_W, IMG_H = 96, 96
-FRAME_SIZE  = IMG_W * IMG_H * 3
+# RGB565 usa 2 byte per pixel invece di 3
+FRAME_SIZE  = IMG_W * IMG_H * 2
 DATASET_DIR = Path("dataset/raw")
 CLASSES     = ["red", "green", "blue", "off"]
 TARGET_PER_CLASS = 300
@@ -48,7 +49,7 @@ def sync_to_header(ser: serial.Serial) -> bool:
     return False
 
 def read_frame(ser: serial.Serial) -> np.ndarray | None:
-    """Legge un frame completo secondo il protocollo custom."""
+    """Legge un frame completo in formato RGB565."""
     if not sync_to_header(ser):
         print("[WARN] Timeout sincronizzazione header")
         return None
@@ -60,7 +61,8 @@ def read_frame(ser: serial.Serial) -> np.ndarray | None:
 
     if payload_size != FRAME_SIZE:
         print(f"[WARN] Size inattesa: {payload_size} (attesa {FRAME_SIZE})")
-        ser.read(payload_size + 2)  # flush
+        # Svuota il buffer in caso di errore
+        ser.read(ser.in_waiting)
         return None
 
     payload = ser.read(payload_size)
@@ -70,9 +72,17 @@ def read_frame(ser: serial.Serial) -> np.ndarray | None:
         print("[WARN] Footer mancante, frame scartato")
         return None
 
-    # Ricostruzione: RGB888 → BGR per OpenCV
-    frame_rgb = np.frombuffer(payload, dtype=np.uint8).reshape((IMG_H, IMG_W, 3))
-    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    # --- Conversione da RGB565 a BGR (OpenCV) ---
+    # Carichiamo i dati come uint16 (Big Endian)
+    raw_data = np.frombuffer(payload, dtype='>u2').reshape((IMG_H, IMG_W))
+    
+    # Estrazione canali (R: 5 bit, G: 6 bit, B: 5 bit)
+    r = ((raw_data >> 11) & 0x1F) << 3
+    g = ((raw_data >> 5) & 0x3F) << 2
+    b = (raw_data & 0x1F) << 3
+    
+    # Composizione immagine BGR (ordine richiesto da OpenCV)
+    frame_bgr = np.stack([b, g, r], axis=-1).astype(np.uint8)
     return frame_bgr
 
 def save_frame(frame: np.ndarray, cls: str) -> str:
@@ -84,6 +94,7 @@ def save_frame(frame: np.ndarray, cls: str) -> str:
 
 def draw_hud(frame: np.ndarray) -> np.ndarray:
     """Overlay con statistiche sul frame di preview."""
+    # Resize per visualizzazione (INTER_NEAREST mantiene i pixel nitidi)
     display = cv2.resize(frame, (384, 384), interpolation=cv2.INTER_NEAREST)
     display = cv2.copyMakeBorder(display, 0, 100, 0, 0,
                                   cv2.BORDER_CONSTANT, value=(30, 30, 30))
@@ -106,28 +117,33 @@ def draw_hud(frame: np.ndarray) -> np.ndarray:
 # ── Main loop ────────────────────────────────────────────────────
 def main():
     print(f"Connessione a {PORT} @ {BAUD_RATE} baud...")
-    with serial.Serial(PORT, BAUD_RATE, timeout=2) as ser:
-        time.sleep(2)
-        ser.reset_input_buffer()
-        print("Connesso. Premi un tasto per salvare il frame corrente.")
+    try:
+        with serial.Serial(PORT, BAUD_RATE, timeout=2) as ser:
+            time.sleep(2)
+            ser.reset_input_buffer()
+            print("Connesso. Premi un tasto per salvare il frame corrente.")
 
-        while True:
-            frame = read_frame(ser)
-            if frame is None:
-                continue
+            while True:
+                frame = read_frame(ser)
+                if frame is None:
+                    continue
 
-            display = draw_hud(frame)
-            cv2.imshow("ESP32-CAM — Data Collector", display)
+                display = draw_hud(frame)
+                cv2.imshow("ESP32-CAM — Data Collector", display)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key in KEY_MAP and KEY_MAP[key]:
-                cls  = KEY_MAP[key]
-                path = save_frame(frame, cls)
-                print(f"[SAVE] {path}  |  {cls}: {counters[cls]}/{TARGET_PER_CLASS}")
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key in KEY_MAP and KEY_MAP[key]:
+                    cls  = KEY_MAP[key]
+                    path = save_frame(frame, cls)
+                    print(f"[SAVE] {path}  |  {cls}: {counters[cls]}/{TARGET_PER_CLASS}")
 
+    except Exception as e:
+        print(f"Errore: {e}")
+    finally:
         cv2.destroyAllWindows()
+    
     print("\nRiepilogo finale:")
     for cls, cnt in counters.items():
         print(f"  {cls:6s}: {cnt:4d} immagini")

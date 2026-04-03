@@ -96,7 +96,7 @@ bool initCamera() {
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   
   // Impostazioni pixel format
-  config.pixel_format = PIXFORMAT_RGB888;  // Si può usare anche PIXFORMAT_RGB565
+  config.pixel_format = PIXFORMAT_RGB565; 
   
   // Inizializzazione camera
   esp_err_t err = esp_camera_init(&config);
