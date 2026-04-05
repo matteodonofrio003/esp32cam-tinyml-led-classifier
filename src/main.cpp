@@ -98,14 +98,14 @@ bool initCamera() {
   // Pixel format settings
   config.pixel_format = PIXFORMAT_RGB565; 
   
-  // Inizializzazione camera
+  // Initialize camera
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Errore inizializzazione camera: 0x%x\n", err);
     return false;
   }
   
-  // Configurazione aggiuntiva dei parametri della camera
+  // Configuration of camera settings
   sensor_t* s = esp_camera_sensor_get();
   if (s != NULL) {
     // Impostazioni di controllo automatico
@@ -116,12 +116,12 @@ bool initCamera() {
     // Controllo automatico
     s->set_ae_level(s, 0);         // Auto exposure level (da -2 a 2)
     s->set_aec2(s, false);         // Auto exposure compression
-    s->set_awb_gain(s, true);      // Guadagno bilanciamento bianco
-    s->set_agc_gain(s, 0);         // Guadagno controllo guadagno auto (0=auto)
+    s->set_awb_gain(s, true);      // Auto white balance
+    s->set_agc_gain(s, 0);         // Auto gain control (0-30)
     
     // Specchio/Flip
-    s->set_hmirror(s, 0);          // Flip orizzontale
-    s->set_vflip(s, 0);            // Flip verticale
+    s->set_hmirror(s, 0);          // Horizontal flip
+    s->set_vflip(s, 0);            // Vertical flip
   }
   
   Serial.println("Camera inizializzata correttamente!");
