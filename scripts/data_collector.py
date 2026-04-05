@@ -8,35 +8,35 @@ import struct
 from pathlib import Path
 from collections import defaultdict
 
-# ── Configurazione ──────────────────────────────────────────────
-PORT        = "COM12"          # Verifica che sia la porta corretta
+# ── Configuration ──────────────────────────────────────────────
+PORT        = "COM12"          # Verify that this is the correct port
 BAUD_RATE   = 921600
 IMG_W, IMG_H = 96, 96
 # RGB565 usa 2 byte per pixel invece di 3
 FRAME_SIZE  = IMG_W * IMG_H * 2
 DATASET_DIR = Path("dataset/raw")
-CLASSES     = ["red", "green", "blue", "off"]
+CLASSES     = ["red", "green", "blue", "no_led"]
 TARGET_PER_CLASS = 300
 
 HEADER = bytes([0xAA, 0xBB])
 FOOTER = bytes([0xCC, 0xDD])
 
-# ── Setup directory ──────────────────────────────────────────────
+# ── Directory setup ──────────────────────────────────────────────
 for cls in CLASSES:
     (DATASET_DIR / cls).mkdir(parents=True, exist_ok=True)
 
-# ── Contatori ────────────────────────────────────────────────────
+# ── Counters ────────────────────────────────────────────────────
 counters = defaultdict(int)
 for cls in CLASSES:
     counters[cls] = len(list((DATASET_DIR / cls).glob("*.png")))
 
 KEY_MAP = {ord('r'): 'red', ord('g'): 'green',
-           ord('b'): 'blue', ord('o'): 'off',
+           ord('b'): 'blue', ord('n'): 'no_led',
            ord('q'): None}
 
-# ── Funzioni di protocollo ───────────────────────────────────────
+# ── Protocol functions ───────────────────────────────────────
 def sync_to_header(ser: serial.Serial) -> bool:
-    """Sincronizza lo stream sull'header 0xAA 0xBB."""
+    """Synchronize the stream to the 0xAA 0xBB header."""
     buf = bytearray()
     deadline = time.time() + 3.0
     while time.time() < deadline:
@@ -49,9 +49,9 @@ def sync_to_header(ser: serial.Serial) -> bool:
     return False
 
 def read_frame(ser: serial.Serial) -> np.ndarray | None:
-    """Legge un frame completo in formato RGB565."""
+    """Read a complete frame in RGB565 format."""
     if not sync_to_header(ser):
-        print("[WARN] Timeout sincronizzazione header")
+        print("[WARN] Header synchronization timeout")
         return None
 
     size_bytes = ser.read(4)
@@ -60,8 +60,8 @@ def read_frame(ser: serial.Serial) -> np.ndarray | None:
     payload_size = struct.unpack('>I', size_bytes)[0]
 
     if payload_size != FRAME_SIZE:
-        print(f"[WARN] Size inattesa: {payload_size} (attesa {FRAME_SIZE})")
-        # Svuota il buffer in caso di errore
+        print(f"[WARN] Unexpected size: {payload_size} (expected {FRAME_SIZE})")
+        # Clear buffer in case of error
         ser.read(ser.in_waiting)
         return None
 
@@ -69,19 +69,19 @@ def read_frame(ser: serial.Serial) -> np.ndarray | None:
     footer  = ser.read(2)
 
     if footer != FOOTER:
-        print("[WARN] Footer mancante, frame scartato")
+        print("[WARN] Missing footer, frame discarded")
         return None
 
-    # --- Conversione da RGB565 a BGR (OpenCV) ---
-    # Carichiamo i dati come uint16 (Big Endian)
+    # --- RGB565 to BGR (OpenCV) conversion ---
+    # Load data as uint16 (Big Endian)
     raw_data = np.frombuffer(payload, dtype='>u2').reshape((IMG_H, IMG_W))
     
-    # Estrazione canali (R: 5 bit, G: 6 bit, B: 5 bit)
+    # Extract channels (R: 5 bits, G: 6 bits, B: 5 bits)
     r = ((raw_data >> 11) & 0x1F) << 3
     g = ((raw_data >> 5) & 0x3F) << 2
     b = (raw_data & 0x1F) << 3
     
-    # Composizione immagine BGR (ordine richiesto da OpenCV)
+    # Compose BGR image (order required by OpenCV)
     frame_bgr = np.stack([b, g, r], axis=-1).astype(np.uint8)
     return frame_bgr
 
@@ -93,8 +93,8 @@ def save_frame(frame: np.ndarray, cls: str) -> str:
     return str(filename)
 
 def draw_hud(frame: np.ndarray) -> np.ndarray:
-    """Overlay con statistiche sul frame di preview."""
-    # Resize per visualizzazione (INTER_NEAREST mantiene i pixel nitidi)
+    """Overlay with statistics on preview frame."""
+    # Resize for display (INTER_NEAREST keeps pixels sharp)
     display = cv2.resize(frame, (384, 384), interpolation=cv2.INTER_NEAREST)
     display = cv2.copyMakeBorder(display, 0, 100, 0, 0,
                                   cv2.BORDER_CONSTANT, value=(30, 30, 30))
@@ -110,18 +110,18 @@ def draw_hud(frame: np.ndarray) -> np.ndarray:
         label  = f"{cls[0].upper()}:{count}"
         cv2.putText(display, label, (x_off, y+35),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220,220,220), 1)
-    cv2.putText(display, "R=red G=green B=blue O=off Q=quit",
+    cv2.putText(display, "R=red G=green B=blue N=no_led Q=quit",
                 (10, y+60), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150,150,150), 1)
     return display
 
 # ── Main loop ────────────────────────────────────────────────────
 def main():
-    print(f"Connessione a {PORT} @ {BAUD_RATE} baud...")
+    print(f"Connecting to {PORT} @ {BAUD_RATE} baud...")
     try:
         with serial.Serial(PORT, BAUD_RATE, timeout=2) as ser:
             time.sleep(2)
             ser.reset_input_buffer()
-            print("Connesso. Premi un tasto per salvare il frame corrente.")
+            print("Connected. Press a key to save the current frame.")
 
             while True:
                 frame = read_frame(ser)
@@ -144,7 +144,7 @@ def main():
     finally:
         cv2.destroyAllWindows()
     
-    print("\nRiepilogo finale:")
+    print("\nFinal summary:")
     for cls, cnt in counters.items():
         print(f"  {cls:6s}: {cnt:4d} immagini")
 

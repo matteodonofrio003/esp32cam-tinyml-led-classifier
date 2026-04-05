@@ -17,7 +17,7 @@ FOOTER = b'\xcc\xdd'
 
 # Directory to save dataset
 DATASET_DIR = "dataset"
-categories = ["red", "green", "blue", "off"]
+categories = ["red", "green", "blue", "no_led"]
 
 for cat in categories:
     os.makedirs(os.path.join(DATASET_DIR, cat), exist_ok=True)
@@ -79,8 +79,8 @@ def main():
                         save_frame(img_bgr, "green")
                     elif key == ord('b'): # Save Blue
                         save_frame(img_bgr, "blue")
-                    elif key == ord('o'): # Save Off
-                        save_frame(img_bgr, "off")
+                    elif key == ord('n'): # Save No LED
+                        save_frame(img_bgr, "no_led")
 
     except Exception as e:
         print(f"Error: {e}")

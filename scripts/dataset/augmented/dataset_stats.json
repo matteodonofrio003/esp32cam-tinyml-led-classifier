@@ -1,0 +1,31 @@
+{
+  "generated_at": "2026-04-05T18:22:22.070046",
+  "augment_factor": 4,
+  "img_size": [
+    96,
+    96
+  ],
+  "classes": {
+    "red": {
+      "original": 100,
+      "augmented": 300,
+      "total": 400
+    },
+    "green": {
+      "original": 100,
+      "augmented": 300,
+      "total": 400
+    },
+    "blue": {
+      "original": 100,
+      "augmented": 300,
+      "total": 400
+    },
+    "no_led": {
+      "original": 100,
+      "augmented": 300,
+      "total": 400
+    }
+  },
+  "grand_total": 1600
+}
