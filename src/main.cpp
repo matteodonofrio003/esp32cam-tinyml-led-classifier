@@ -1,54 +1,22 @@
-/**
- * main.cpp
- * ════════════════════════════════════════════════════════════════════════════
- * LED Classifier — Inferenza on-device con TFLite Micro
- * Hardware : ESP32-CAM Freenove WROVER
- * Modello  : led_cnn INT8 (led_model_data.h)
- * Classi   : 0=red | 1=green | 2=blue | 3=no_led
- *
- * Flusso principale:
- *   setup() → inizializza camera + TFLite interpreter
- *   loop()  → cattura frame → preprocess → inferenza → pubblica risultato
- *
- * Output seriale (115200 baud):
- *   JSON per ogni frame  {"class":"red","confidence":0.97,"ms":112}
- *   Oppure testo leggibile se VERBOSE_OUTPUT = true
- * ════════════════════════════════════════════════════════════════════════════
- */
-
 #include <Arduino.h>
 #include "esp_camera.h"
-#include "esp_heap_caps.h"
+#include "esp_heap_caps.h" // NOSTRO FIX: Per la PSRAM
 
-// TensorFlow Lite Micro
 #include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
-//#include "tensorflow/lite/micro/micro_log.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h" // NOSTRO FIX: Per l'errore di compilazione
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/micro/micro_error_reporter.h"
-
-// Modello generato da Colab (copia led_model_data.h in src/)
 #include "led_model_data.h"
 
-// ── Configurazione ───────────────────────────────────────────────────────────
+#define CONFIDENCE_THRESHOLD  0.70f
+#define IMG_WIDTH             96
+#define IMG_HEIGHT            96
+#define IMG_CHANNELS          3
+#define TFLITE_ARENA_SIZE     (512 * 1024) // NOSTRO FIX: Mezzo MegaByte
 
-// Imposta a true per output human-readable, false per JSON (es. parsing Python)
-#define VERBOSE_OUTPUT      false
+#define STREAM_EVERY_N_FRAMES 1
 
-// Soglia minima di confidenza per considerare valida una predizione
-#define CONFIDENCE_THRESHOLD 0.70f
-
-// Dimensioni immagine attese dal modello (devono corrispondere al training)
-#define IMG_WIDTH   96
-#define IMG_HEIGHT  96
-#define IMG_CHANNELS 3
-
-// Memoria arena per TFLite Micro
-// 96KB: dimensionato per la CNN con attivazioni INT8 + overhead
-// Se ottieni un errore "AllocateTensors failed" aumenta di 8KB alla volta
-#define TFLITE_ARENA_SIZE (512 * 1024) // 512 KB in PSRAM
-
-// ── Pin camera Freenove WROVER ───────────────────────────────────────────────
+// Pin Freenove WROVER
 #define PWDN_GPIO_NUM  -1
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM  21
@@ -66,32 +34,23 @@
 #define HREF_GPIO_NUM  23
 #define PCLK_GPIO_NUM  22
 
-// ── Label classi (ordine identico al training) ───────────────────────────────
 const char* CLASS_LABELS[] = {"red", "green", "blue", "no_led"};
 const int   NUM_CLASSES    = 4;
 
-// ── Variabili globali TFLite ─────────────────────────────────────────────────
+const uint8_t FRAME_HEADER[2] = {0xAA, 0xBB};
+const uint8_t FRAME_FOOTER[2] = {0xCC, 0xDD};
+
 namespace {
-    // Arena di memoria statica per TFLite Micro (in DRAM)
-    uint8_t* tflite_arena = nullptr;
-
-    const tflite::Model*        model       = nullptr;
-    tflite::MicroInterpreter*   interpreter = nullptr;
-    TfLiteTensor*               input       = nullptr;
-    TfLiteTensor*               output      = nullptr;
-
-    // Statistiche runtime
-    uint32_t inference_count = 0;
-    uint32_t total_ms        = 0;
+    uint8_t* tflite_arena = nullptr; // NOSTRO FIX: Puntatore per PSRAM
+    const tflite::Model*       model       = nullptr;
+    tflite::MicroInterpreter*  interpreter = nullptr;
+    TfLiteTensor*              input       = nullptr;
+    TfLiteTensor*              output      = nullptr;
+    uint32_t                   frame_count = 0;
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-// Inizializzazione fotocamera
-// ════════════════════════════════════════════════════════════════════════════
 
 bool init_camera() {
     camera_config_t config;
-
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer   = LEDC_TIMER_0;
     config.pin_d0       = Y2_GPIO_NUM;
@@ -110,335 +69,150 @@ bool init_camera() {
     config.pin_sccb_scl = SIOC_GPIO_NUM;
     config.pin_pwdn     = PWDN_GPIO_NUM;
     config.pin_reset    = RESET_GPIO_NUM;
-
-    // Clock: 20MHz stabile per RGB888 a 96x96
     config.xclk_freq_hz = 20000000;
-
-    // RGB888: 3 byte/pixel — stesso formato del training
-    config.pixel_format = PIXFORMAT_RGB565;
-
-    // Risoluzione minima che supporta 96x96 nativamente
+    
+    // NOSTRO FIX: RGB565 per evitare il Kernel Panic
+    config.pixel_format = PIXFORMAT_RGB565; 
     config.frame_size   = FRAMESIZE_96X96;
-
-    config.jpeg_quality = 10;   // non usato con RGB888, ma richiesto dalla struct
-    config.fb_count     = 1;    // 1 frame buffer: riduce RAM, sufficiente per inferenza
-
-    // PSRAM: usa fb in PSRAM se disponibile
+    config.jpeg_quality = 10;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
-    config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+    config.fb_count     = 2;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
 
     esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        Serial.printf("[CAMERA] Errore init: 0x%x\n", err);
-        return false;
-    }
+    if (err != ESP_OK) return false;
 
-    // Ottimizzazioni sensore OV2640 per classificazione colore LED
-    sensor_t* sensor = esp_camera_sensor_get();
-    if (sensor) {
-        sensor->set_whitebal(sensor, 0);       // AWB OFF: colori stabili e ripetibili
-        sensor->set_awb_gain(sensor, 0);       // Auto gain bilanciamento OFF
-        sensor->set_wb_mode(sensor, 0);        // Modalità WB: auto disabilitata
-        sensor->set_exposure_ctrl(sensor, 1);  // AEC ON: adatta la luminosità
-        sensor->set_aec2(sensor, 1);           // AEC DSP ON
-        sensor->set_gain_ctrl(sensor, 1);      // AGC ON
-        sensor->set_bpc(sensor, 1);            // Bad pixel correction ON
-        sensor->set_wpc(sensor, 1);            // White pixel correction ON
-        sensor->set_raw_gma(sensor, 1);        // Gamma correction ON
-        sensor->set_lenc(sensor, 1);           // Lens correction ON
-        sensor->set_saturation(sensor, 1);     // Lieve boost saturazione (↑ discriminazione colori)
-        sensor->set_contrast(sensor, 1);       // Contrasto leggermente aumentato
+    sensor_t* s = esp_camera_sensor_get();
+    if (s) {
+        s->set_whitebal(s, 1);       
+        s->set_awb_gain(s, 1);
+        s->set_wb_mode(s, 0);
+        s->set_exposure_ctrl(s, 1);  
+        s->set_aec2(s, 1);
+        s->set_gain_ctrl(s, 1);      
+        s->set_bpc(s, 1);
+        s->set_wpc(s, 1);
+        s->set_raw_gma(s, 1);
+        s->set_lenc(s, 1);
+        s->set_saturation(s, 1);     
+        s->set_contrast(s, 1);
     }
-
-    Serial.println("[CAMERA] Inizializzata ✓  RGB888 @ 96x96");
     return true;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// Inizializzazione TFLite Micro
-// ════════════════════════════════════════════════════════════════════════════
-
 bool init_tflite() {
-
+    // NOSTRO FIX: Allocazione in PSRAM
     if (tflite_arena == nullptr) {
         tflite_arena = (uint8_t*)heap_caps_malloc(TFLITE_ARENA_SIZE, MALLOC_CAP_SPIRAM);
-        if (tflite_arena == nullptr) {
-            Serial.println("[FATAL] Impossibile allocare la Tensor Arena in PSRAM!");
-            return false;
-        }
+        if (!tflite_arena) return false;
     }
 
-    // 1. Carica il modello dall'array C (led_model_data.h)
     model = tflite::GetModel(led_model_data);
-
-    if (model->version() != TFLITE_SCHEMA_VERSION) {
-        Serial.printf("[TFLITE] Schema version mismatch: %d vs %d\n",
-                      model->version(), TFLITE_SCHEMA_VERSION);
-        return false;
-    }
-
-    // 2. AllOpsResolver: include tutti gli operatori standard
-    //    Per un footprint minore si può usare MicroMutableOpResolver
-    //    e registrare solo: DepthwiseConv2D, Conv2D, MaxPool2D,
-    //    FullyConnected, Softmax, Reshape, Mean (GlobalAveragePooling)
-    static tflite::AllOpsResolver resolver;
+    
+    // NOSTRO FIX: L'Error reporter per far felice il compilatore
     static tflite::MicroErrorReporter micro_error_reporter;
     tflite::ErrorReporter* error_reporter = &micro_error_reporter;
 
-    // 3. Crea l'interpreter con l'arena statica
+    static tflite::AllOpsResolver resolver;
     static tflite::MicroInterpreter static_interpreter(
-        model, resolver, tflite_arena, TFLITE_ARENA_SIZE, error_reporter
-    );
+        model, resolver, tflite_arena, TFLITE_ARENA_SIZE, error_reporter);
     interpreter = &static_interpreter;
 
-    // 4. Alloca i tensori nell'arena
-    TfLiteStatus alloc_status = interpreter->AllocateTensors();
-    if (alloc_status != kTfLiteOk) {
-        Serial.println("[TFLITE] AllocateTensors FALLITO");
-        Serial.println("         → Aumenta TFLITE_ARENA_SIZE di 8KB");
-        return false;
-    }
+    if (interpreter->AllocateTensors() != kTfLiteOk) return false;
 
-    // 5. Ottieni i puntatori ai tensori di input/output
     input  = interpreter->input(0);
     output = interpreter->output(0);
-
-    // 6. Verifica le dimensioni (sanity check)
-    bool shape_ok = (input->dims->size    == 4         &&
-                     input->dims->data[0] == 1         &&   // batch
-                     input->dims->data[1] == IMG_HEIGHT &&  // H
-                     input->dims->data[2] == IMG_WIDTH  &&  // W
-                     input->dims->data[3] == IMG_CHANNELS); // C
-
-    if (!shape_ok) {
-        Serial.printf("[TFLITE] Input shape inattesa: [%d,%d,%d,%d]\n",
-                      input->dims->data[0], input->dims->data[1],
-                      input->dims->data[2], input->dims->data[3]);
-        return false;
-    }
-
-    // Report memoria
-    size_t used_bytes = interpreter->arena_used_bytes();
-    Serial.printf("[TFLITE] Inizializzato ✓\n");
-    Serial.printf("         Arena usata  : %u / %u bytes (%.1f%%)\n",
-                  used_bytes, TFLITE_ARENA_SIZE,
-                  (float)used_bytes / TFLITE_ARENA_SIZE * 100.0f);
-    Serial.printf("         Input dtype  : %s\n",
-                  input->type == kTfLiteFloat32 ? "float32" : "int8");
-    Serial.printf("         Output shape : [1, %d]\n", output->dims->data[1]);
-
     return true;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// Preprocessing: frame buffer → tensore di input
-// ════════════════════════════════════════════════════════════════════════════
+void stream_frame(const uint8_t* data, size_t len) {
+    Serial.write(FRAME_HEADER, 2);
+    uint8_t sz[4] = {
+        (uint8_t)((len >> 24) & 0xFF),
+        (uint8_t)((len >> 16) & 0xFF),
+        (uint8_t)((len >>  8) & 0xFF),
+        (uint8_t)((len      ) & 0xFF)
+    };
+    Serial.write(sz, 4);
 
-/**
- * Copia il frame RGB888 nel tensore di input TFLite,
- * normalizzando i pixel da [0,255] a [0.0, 1.0].
- *
- * NOTA: la fotocamera produce RGB, il modello è stato addestrato su immagini
- * che OpenCV ha convertito da RGB a BGR e poi salvato come PNG.
- * cv2.imwrite() salva BGR → PNG, cv2.imread() rilegge BGR.
- * Il training usa tf.image.decode_png() che legge come RGB.
- * Quindi il modello si aspetta RGB — nessuna conversione necessaria qui.
- */
-void preprocess_frame(const uint8_t* fb_data) {
-    float* input_data = input->data.f;  // Tensore di input Float32
+    const size_t CHUNK = 1024;
+    size_t sent = 0;
+    while (sent < len) {
+        size_t to_send = min(CHUNK, len - sent);
+        Serial.write(data + sent, to_send);
+        sent += to_send;
+    }
+    Serial.write(FRAME_FOOTER, 2);
+}
 
-    const int total_pixels = IMG_WIDTH * IMG_HEIGHT;
-
-    for (int i = 0; i < total_pixels; i++) {
-        // L'OV2640 in RGB565 invia 2 byte per pixel (Big Endian)
+// NOSTRO FIX: La matematica per decodificare l'RGB565
+void preprocess(const uint8_t* fb_data) {
+    float* in = input->data.f;
+    const int n = IMG_WIDTH * IMG_HEIGHT;
+    for (int i = 0; i < n; i++) {
         uint16_t pixel = (fb_data[i * 2] << 8) | fb_data[i * 2 + 1];
-
-        // Estraiamo i singoli canali (5 bit per Rosso, 6 per Verde, 5 per Blu)
         uint8_t r = (pixel >> 11) & 0x1F;
         uint8_t g = (pixel >> 5)  & 0x3F;
         uint8_t b =  pixel        & 0x1F;
-
-        // Normalizziamo direttamente da 0.0 a 1.0 per l'intelligenza artificiale
-        input_data[i * 3 + 0] = (float)r / 31.0f;  // Il max del rosso è 31
-        input_data[i * 3 + 1] = (float)g / 63.0f;  // Il max del verde è 63
-        input_data[i * 3 + 2] = (float)b / 31.0f;  // Il max del blu è 31
+        in[i*3+0] = (float)r / 31.0f;
+        in[i*3+1] = (float)g / 63.0f;
+        in[i*3+2] = (float)b / 31.0f;
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// Inferenza e parsing del risultato
-// ════════════════════════════════════════════════════════════════════════════
-
-struct Prediction {
-    int   class_idx;
-    float confidence;
-    bool  above_threshold;
-};
+struct Prediction { int idx; float conf; };
 
 Prediction run_inference() {
-    TfLiteStatus invoke_status = interpreter->Invoke();
-
-    if (invoke_status != kTfLiteOk) {
-        return {-1, 0.0f, false};
-    }
-
-    // Output: vettore di probabilità softmax [red, green, blue, no_led]
-    float* probs = output->data.f;
-
-    int   best_idx  = 0;
-    float best_prob = probs[0];
-
-    for (int i = 1; i < NUM_CLASSES; i++) {
-        if (probs[i] > best_prob) {
-            best_prob = probs[i];
-            best_idx  = i;
-        }
-    }
-
-    return {
-        best_idx,
-        best_prob,
-        best_prob >= CONFIDENCE_THRESHOLD
-    };
+    interpreter->Invoke();
+    float* p  = output->data.f;
+    int best  = 0;
+    for (int i = 1; i < NUM_CLASSES; i++)
+        if (p[i] > p[best]) best = i;
+    return {best, p[best]};
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-// Output seriale
-// ════════════════════════════════════════════════════════════════════════════
-
-void print_result(const Prediction& pred, uint32_t elapsed_ms) {
-    const char* label = pred.above_threshold
-                        ? CLASS_LABELS[pred.class_idx]
-                        : "uncertain";
-
-    if (VERBOSE_OUTPUT) {
-        // Output leggibile per debug
-        Serial.printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-        Serial.printf("  Classe      : %s\n", label);
-        Serial.printf("  Confidenza  : %.1f%%\n", pred.confidence * 100.0f);
-        Serial.printf("  Latenza     : %u ms\n", elapsed_ms);
-        Serial.printf("  Inferenze   : %u  (media: %u ms)\n",
-                      inference_count,
-                      inference_count > 0 ? total_ms / inference_count : 0);
-
-        if (pred.above_threshold) {
-            // Stampa distribuzione completa delle probabilità
-            float* probs = output->data.f;
-            for (int i = 0; i < NUM_CLASSES; i++) {
-                Serial.printf("  [%s]%s %.1f%%\n",
-                    CLASS_LABELS[i],
-                    (i == pred.class_idx) ? " ◄" : "  ",
-                    probs[i] * 100.0f);
-            }
-        }
-    } else {
-        // Output JSON compatto — facile da parsare lato Python/Node
-        float* probs = output->data.f;
-        Serial.printf("{\"class\":\"%s\","
-                       "\"confidence\":%.3f,"
-                       "\"probs\":[%.3f,%.3f,%.3f,%.3f],"
-                       "\"ms\":%u}\n",
-                      label,
-                      pred.confidence,
-                      probs[0], probs[1], probs[2], probs[3],
-                      elapsed_ms);
-    }
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// SETUP
-// ════════════════════════════════════════════════════════════════════════════
 
 void setup() {
-    Serial.begin(115200);
-    delay(500);
+    Serial.begin(460800);
+    delay(300);
 
-    Serial.println("\n╔══════════════════════════════════════╗");
-    Serial.println("║   LED Classifier — TFLite Micro      ║");
-    Serial.println("║   ESP32-CAM Freenove WROVER           ║");
-    Serial.println("╚══════════════════════════════════════╝");
-
-    // Inizializza camera
-    if (!init_camera()) {
-        Serial.println("[FATAL] Camera init fallita. Riavvio...");
-        delay(3000);
-        ESP.restart();
-    }
-
-    // Warm-up camera: scarta i primi 10 frame
-    // L'OV2640 ha bisogno di qualche frame per stabilizzare AEC/AGC
-    Serial.print("[CAMERA] Warm-up");
-    for (int i = 0; i < 10; i++) {
+    if (!init_camera()) { delay(3000); ESP.restart(); }
+    for (int i = 0; i < 8; i++) {
         camera_fb_t* fb = esp_camera_fb_get();
         if (fb) esp_camera_fb_return(fb);
-        delay(50);
-        Serial.print(".");
+        delay(40);
     }
-    Serial.println(" ✓");
-
-    // Inizializza TFLite
-    if (!init_tflite()) {
-        Serial.println("[FATAL] TFLite init fallita. Riavvio...");
-        delay(3000);
-        ESP.restart();
-    }
-
-    // Info memoria
-    Serial.printf("\n[MEM] Free heap       : %u bytes\n", ESP.getFreeHeap());
-    Serial.printf("[MEM] Free PSRAM      : %u bytes\n", ESP.getFreePsram());
-    Serial.printf("[MEM] Arena TFLite    : %u bytes\n", TFLITE_ARENA_SIZE);
-    Serial.printf("[CFG] Soglia conf.    : %.0f%%\n\n", CONFIDENCE_THRESHOLD * 100.0f);
-
-    Serial.println("Sistema pronto. Avvio inferenza continua...\n");
+    if (!init_tflite()) { delay(3000); ESP.restart(); }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// LOOP
-// ════════════════════════════════════════════════════════════════════════════
-
 void loop() {
-    // ── 1. Cattura frame ─────────────────────────────────────────────────────
-    uint32_t t_start = millis();
+    uint32_t t0 = millis();
 
     camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) {
-        Serial.println("[WARN] Frame buffer null, skip");
-        delay(100);
-        return;
-    }
+    if (!fb) { delay(5); return; }
 
-    // Verifica dimensioni frame (sicurezza)
-    const size_t expected_size = IMG_WIDTH * IMG_HEIGHT * 2;
-    if (fb->len != expected_size) {
-        Serial.printf("[WARN] Frame size inattesa: %u (attesa %u)\n",
-                      fb->len, expected_size);
+    // NOSTRO FIX: Verifica la dimensione per RGB565 (2 byte)
+    if (fb->len != (size_t)(IMG_WIDTH * IMG_HEIGHT * 2)) {
         esp_camera_fb_return(fb);
         return;
     }
 
-    // ── 2. Preprocessing ─────────────────────────────────────────────────────
-    preprocess_frame(fb->buf);
+    frame_count++;
 
-    // Rilascia subito il frame buffer (libera RAM/PSRAM)
+    preprocess(fb->buf);
+    Prediction pred = run_inference();
+    uint32_t elapsed = millis() - t0;
+
+    if (frame_count % STREAM_EVERY_N_FRAMES == 0) {
+        stream_frame(fb->buf, fb->len);
+    }
     esp_camera_fb_return(fb);
 
-    // ── 3. Inferenza ─────────────────────────────────────────────────────────
-    Prediction pred = run_inference();
+    const char* label = (pred.conf >= CONFIDENCE_THRESHOLD)
+                        ? CLASS_LABELS[pred.idx] : "uncertain";
 
-    uint32_t elapsed = millis() - t_start;
-
-    if (pred.class_idx < 0) {
-        Serial.println("[ERROR] Invoke fallito");
-        return;
-    }
-
-    // ── 4. Aggiorna statistiche ───────────────────────────────────────────────
-    inference_count++;
-    total_ms += elapsed;
-
-    // ── 5. Output ─────────────────────────────────────────────────────────────
-    print_result(pred, elapsed);
-
-    // Nessun delay artificiale: la camera è il collo di bottiglia naturale
-    // Il loop gira a ~8-12 FPS con RGB888 96x96 + inferenza INT8
+    float* p = output->data.f;
+    Serial.printf("{\"class\":\"%s\",\"confidence\":%.3f,"
+                  "\"probs\":[%.3f,%.3f,%.3f,%.3f],\"ms\":%u}\n",
+                  label, pred.conf,
+                  p[0], p[1], p[2], p[3], elapsed);
 }
